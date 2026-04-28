@@ -723,4 +723,36 @@ def render_canvas() -> None:
     st.subheader("Canvas")
     st.caption(f"{project.width} x {project.height} px | {project.frame_count} frame(s) | {len(project.layers)} layer(s)")
 
-    if has_live_pixel
+    if has_live_pixel_canvas():
+        render_live_canvas(cursor)
+    else:
+        preview = build_canvas_preview()
+        st.warning("Live pixel preview is unavailable because `st.components.v2` is not present in this Streamlit build. Falling back to the older click-and-drag canvas.")
+        render_legacy_pointer_canvas(preview, cursor)
+
+
+def main() -> None:
+    st.set_page_config(page_title=APP_NAME, page_icon="🎨", layout="wide")
+    init_state()
+    render_sidebar()
+    sanitize_indices()
+
+    st.title(APP_NAME)
+    st.caption("A browser-oriented Streamlit port of the original desktop editor. The canvas now uses a custom live pixel component so brush strokes and drag previews appear immediately in the browser instead of waiting until mouse release.")
+
+    left, right = st.columns([2.4, 1.2])
+    with left:
+        render_canvas()
+    with right:
+        render_frame_controls()
+        render_layer_controls()
+        render_slice_controls()
+
+    sheet, meta = build_sprite_sheet(st.session_state.project)
+    with st.expander("Sprite sheet preview", expanded=False):
+        st.image(sheet, caption=f"{meta['meta']['size']['w']} x {meta['meta']['size']['h']} px", use_container_width=False)
+        st.json(meta)
+
+
+if __name__ == "__main__":
+    main()
