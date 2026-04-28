@@ -220,6 +220,165 @@ function resetActivePreview(state) {
   copyCanvas(state.activeCanvas, state.activePreviewCanvas);
 }
 
+function isMutatingTool(tool) {
+  return ["pencil", "eraser", "fill", "line", "rect", "ellipse", "move"].includes(tool);
+}
+
+function isBlockedByLock(tool) {
+  return tool !== "eyedropper";
+}
+
+function clonePayload(payload) {
+  return JSON.parse(JSON.stringify(payload));
+}
+
+function parseHexColor(value) {
+  let hex = (value || "#000000").trim();
+  if (hex.startsWith("#")) {
+    hex = hex.slice(1);
+  }
+  if (hex.length === 3) {
+    hex = hex.split("").map((ch) => ch + ch).join("");
+  }
+  if (hex.length !== 6) {
+    return [0, 0, 0, 255];
+  }
+  return [
+    parseInt(hex.slice(0, 2), 16),
+    parseInt(hex.slice(2, 4), 16),
+    parseInt(hex.slice(4, 6), 16),
+    255,
+  ];
+}
+
+function sameColor(a, b) {
+  return a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3];
+}
+
+function rgbaToCss(color) {
+  return `rgba(${color[0]}, ${color[1]}, ${color[2]}, ${color[3] / 255})`;
+}
+
+function getCellColor(ctx, x, y, zoom) {
+  const rgba = ctx.getImageData(x * zoom, y * zoom, 1, 1).data;
+  return [rgba[0], rgba[1], rgba[2], rgba[3]];
+}
+
+function fillCell(ctx, x, y, zoom, color) {
+  const left = x * zoom;
+  const top = y * zoom;
+  ctx.clearRect(left, top, zoom, zoom);
+  if (color[3] > 0) {
+    ctx.fillStyle = rgbaToCss(color);
+    ctx.fillRect(left, top, zoom, zoom);
+  }
+}
+
+function floodFillCanvas(canvas, point, cssColor, data) {
+  const ctx = canvas.getContext("2d");
+  const replacement = parseHexColor(cssColor);
+  const target = getCellColor(ctx, point.x, point.y, data.zoom);
+  if (sameColor(target, replacement)) {
+    return;
+  }
+  const width = data.sprite_width;
+  const height = data.sprite_height;
+  const visited = new Uint8Array(width * height);
+  const stack = [{ x: point.x, y: point.y }];
+  while (stack.length) {
+    const cell = stack.pop();
+    if (!cell || cell.x < 0 || cell.y < 0 || cell.x >= width || cell.y >= height) {
+      continue;
+    }
+    const index = cell.y * width + cell.x;
+    if (visited[index]) {
+      continue;
+    }
+    visited[index] = 1;
+    if (!sameColor(getCellColor(ctx, cell.x, cell.y, data.zoom), target)) {
+      continue;
+    }
+    fillCell(ctx, cell.x, cell.y, data.zoom, replacement);
+    stack.push({ x: cell.x + 1, y: cell.y });
+    stack.push({ x: cell.x - 1, y: cell.y });
+    stack.push({ x: cell.x, y: cell.y + 1 });
+    stack.push({ x: cell.x, y: cell.y - 1 });
+  }
+}
+
+function translateCanvas(canvas, dxSprites, dySprites, zoom) {
+  const tempCanvas = document.createElement("canvas");
+  tempCanvas.width = canvas.width;
+  tempCanvas.height = canvas.height;
+  const tempCtx = tempCanvas.getContext("2d");
+  tempCtx.imageSmoothingEnabled = false;
+  tempCtx.drawImage(canvas, 0, 0);
+
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(tempCanvas, dxSprites * zoom, dySprites * zoom);
+}
+
+function applyPayloadToCanvas(canvas, payload, data) {
+  if (!payload) {
+    return;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  const brushSize = Math.max(1, Number(payload.brush_size || data.brush_size || 1));
+  const color = payload.color || data.fg_css || "#000000";
+  const start = payload.start || payload.end;
+  const end = payload.end || payload.start;
+  if (!start || !end) {
+    return;
+  }
+
+  if (payload.tool === "pencil" || payload.tool === "eraser") {
+    const erase = payload.tool === "eraser";
+    const path = Array.isArray(payload.path) && payload.path.length ? payload.path : [start, end];
+    let last = path[0] || start;
+    drawLineBrush(ctx, last, last, brushSize, data.zoom, color, erase);
+    for (const point of path.slice(1)) {
+      drawLineBrush(ctx, last, point, brushSize, data.zoom, color, erase);
+      last = point;
+    }
+    if (!samePoint(last, end)) {
+      drawLineBrush(ctx, last, end, brushSize, data.zoom, color, erase);
+    }
+  } else if (payload.tool === "fill") {
+    floodFillCanvas(canvas, end, color, data);
+  } else if (payload.tool === "line") {
+    drawLineBrush(ctx, start, end, brushSize, data.zoom, color, false);
+  } else if (payload.tool === "rect") {
+    drawRectOutline(ctx, start, end, brushSize, data.zoom, color, false);
+  } else if (payload.tool === "ellipse") {
+    drawEllipseOutline(ctx, start, end, brushSize, data.zoom, color);
+  } else if (payload.tool === "move") {
+    translateCanvas(canvas, end.x - start.x, end.y - start.y, data.zoom);
+  }
+}
+
+function rememberPendingPayload(state, payload) {
+  if (!isMutatingTool(payload.tool)) {
+    return;
+  }
+  state.localSeq = Math.max(state.localSeq, Number(payload.seq || 0));
+  state.pendingEvents = state.pendingEvents.filter((item) => Number(item.seq || 0) > state.lastAckedSeq);
+  state.pendingEvents.push(clonePayload(payload));
+}
+
+function prunePendingEvents(state) {
+  state.pendingEvents = state.pendingEvents.filter((item) => Number(item.seq || 0) > state.lastAckedSeq);
+}
+
+function reconcileActiveCanvas(state) {
+  prunePendingEvents(state);
+  for (const payload of state.pendingEvents) {
+    applyPayloadToCanvas(state.activeCanvas, payload, state.data);
+  }
+}
+
 function updateDragPreview(state, point) {
   const drag = state.drag;
   if (!drag) {
@@ -273,201 +432,9 @@ function updateDragPreview(state, point) {
 
 function startDrag(state, point) {
   state.drag = {
-    id: `stroke-${Date.now()}-${++state.eventCounter}`,
+    id: `stroke-${Date.now()}-${state.localSeq + 1}-${++state.eventCounter}`,
     tool: state.data.tool,
     start: { x: point.x, y: point.y },
     end: { x: point.x, y: point.y },
     last: { x: point.x, y: point.y },
-    path: [{ x: point.x, y: point.y }],
-    dragged: false,
-  };
-
-  resetActivePreview(state);
-  const previewCtx = state.activePreviewCanvas.getContext("2d");
-  previewCtx.imageSmoothingEnabled = false;
-
-  if (state.data.tool === "pencil") {
-    drawLineBrush(previewCtx, point, point, state.data.brush_size, state.data.zoom, state.data.fg_css, false);
-  } else if (state.data.tool === "eraser") {
-    drawLineBrush(previewCtx, point, point, state.data.brush_size, state.data.zoom, state.data.fg_css, true);
-  }
-
-  renderScene(state);
-}
-
-function finishDrag(state, point) {
-  const drag = state.drag;
-  if (!drag) {
-    return;
-  }
-
-  updateDragPreview(state, point);
-
-  const payload = {
-    id: drag.id,
-    tool: drag.tool,
-    start: drag.start,
-    end: { x: point.x, y: point.y },
-    dragged: drag.dragged || !samePoint(drag.start, point),
-  };
-
-  if (drag.tool === "pencil" || drag.tool === "eraser") {
-    payload.path = drag.path;
-  }
-
-  state.drag = null;
-  state.setTriggerValue("event", payload);
-}
-
-function cancelDrag(state) {
-  state.drag = null;
-  resetActivePreview(state);
-  renderScene(state);
-}
-
-export default function(component) {
-  const { data, setTriggerValue, parentElement } = component;
-
-  let state = parentElement.__opsPixelEditorState;
-  if (!state) {
-    const root = parentElement.querySelector("#ops-pixel-root") || parentElement;
-    let canvas = root.querySelector("#ops-pixel-canvas");
-    if (!canvas) {
-      canvas = document.createElement("canvas");
-      canvas.id = "ops-pixel-canvas";
-      root.appendChild(canvas);
-    }
-
-    const ctx = canvas.getContext("2d");
-    ctx.imageSmoothingEnabled = false;
-
-    state = {
-      root,
-      canvas,
-      ctx,
-      baseCanvas: document.createElement("canvas"),
-      activeCanvas: document.createElement("canvas"),
-      activePreviewCanvas: document.createElement("canvas"),
-      guidesCanvas: document.createElement("canvas"),
-      renderToken: 0,
-      eventCounter: 0,
-      drag: null,
-      hover: null,
-      data: null,
-      setTriggerValue,
-    };
-
-    canvas.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0 || !state.data) {
-        return;
-      }
-      const point = getSpritePointFromEvent(state, event);
-      state.hover = point;
-      startDrag(state, point);
-      if (state.canvas.setPointerCapture) {
-        state.canvas.setPointerCapture(event.pointerId);
-      }
-      event.preventDefault();
-    });
-
-    canvas.addEventListener("pointermove", (event) => {
-      if (!state.data) {
-        return;
-      }
-      const point = getSpritePointFromEvent(state, event);
-      state.hover = point;
-      if (!state.drag) {
-        renderScene(state);
-        return;
-      }
-      updateDragPreview(state, point);
-      event.preventDefault();
-    });
-
-    canvas.addEventListener("pointerup", (event) => {
-      if (!state.data || !state.drag) {
-        return;
-      }
-      const point = getSpritePointFromEvent(state, event);
-      state.hover = point;
-      finishDrag(state, point);
-      event.preventDefault();
-    });
-
-    canvas.addEventListener("pointercancel", () => {
-      if (state.drag) {
-        cancelDrag(state);
-      }
-    });
-
-    canvas.addEventListener("pointerleave", () => {
-      if (!state.drag) {
-        state.hover = null;
-        renderScene(state);
-      }
-    });
-
-    parentElement.__opsPixelEditorState = state;
-  }
-
-  state.data = data;
-  state.setTriggerValue = setTriggerValue;
-  state.canvas.style.cursor = data.cursor || "crosshair";
-  state.root.style.width = `${data.width}px`;
-  state.root.style.height = `${data.height}px`;
-  state.canvas.style.width = `${data.width}px`;
-  state.canvas.style.height = `${data.height}px`;
-
-  [state.canvas, state.baseCanvas, state.activeCanvas, state.activePreviewCanvas, state.guidesCanvas].forEach((canvas) => {
-    ensureCanvasSize(canvas, data.width, data.height);
-  });
-
-  const token = ++state.renderToken;
-  Promise.all([
-    loadImage(data.base_image),
-    loadImage(data.active_image),
-    loadImage(data.guides_image),
-  ])
-    .then(([baseImage, activeImage, guidesImage]) => {
-      if (token !== state.renderToken) {
-        return;
-      }
-      drawImageToCanvas(state.baseCanvas, baseImage);
-      drawImageToCanvas(state.activeCanvas, activeImage);
-      drawImageToCanvas(state.guidesCanvas, guidesImage);
-      if (!state.drag) {
-        resetActivePreview(state);
-      }
-      renderScene(state);
-    })
-    .catch((error) => {
-      console.error("Failed to render pixel canvas", error);
-    });
-}
-"""
-
-if _HAS_COMPONENT_V2:
-    _pixel_canvas = st.components.v2.component(
-        "ops_live_pixel_canvas",
-        html=_HTML,
-        css=_CSS,
-        js=_JS,
-        isolate_styles=True,
-    )
-else:
-    _pixel_canvas = None
-
-
-def has_live_pixel_canvas() -> bool:
-    return _pixel_canvas is not None
-
-
-def pixel_canvas(data: dict[str, Any], key: str):
-    if _pixel_canvas is None:
-        raise RuntimeError("Streamlit components.v2 is not available.")
-    return _pixel_canvas(
-        data=data,
-        key=key,
-        default={"event": None},
-        on_event_change=lambda: None,
-    )
+    path: [{ x: point.x, y: point
