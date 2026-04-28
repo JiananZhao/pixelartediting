@@ -234,6 +234,15 @@ def build_canvas_preview() -> Image.Image:
     return preview
 
 
+def build_active_raw_canvas() -> Image.Image:
+    project: SpriteProject = st.session_state.project
+    frame_index = st.session_state.current_frame
+    layer_index = st.session_state.current_layer
+    zoom = int(st.session_state.zoom)
+    canvas_size = (project.width * zoom, project.height * zoom)
+    return project.get_cel(layer_index, frame_index).resize(canvas_size, Image.Resampling.NEAREST)
+
+
 def image_to_data_url(image: Image.Image) -> str:
     buf = io.BytesIO()
     image.save(buf, format="PNG")
@@ -679,7 +688,9 @@ def extract_component_event(result: Any) -> dict[str, Any] | None:
 
 
 def render_live_canvas(cursor: str) -> None:
-    lower_canvas, active_canvas, upper_canvas = build_canvas_layers()
+    lower_canvas, _, upper_canvas = build_canvas_layers()
+    active_layer = st.session_state.project.layers[st.session_state.current_layer]
+    active_raw_canvas = build_active_raw_canvas()
     data = {
         "width": lower_canvas.width,
         "height": lower_canvas.height,
@@ -691,11 +702,20 @@ def render_live_canvas(cursor: str) -> None:
         "fg_css": str(st.session_state.fg_color),
         "slice_color": "#00ffff",
         "cursor": cursor,
-        "layer_locked": bool(st.session_state.project.layers[st.session_state.current_layer].locked),
+        "layer_locked": bool(active_layer.locked),
+        "active_visible": bool(active_layer.visible),
+        "active_opacity": int(active_layer.opacity),
         "acked_event_seq": int(st.session_state.last_live_event_seq),
-        "canvas_context": f"{int(st.session_state.canvas_epoch)}:{st.session_state.current_frame}:{st.session_state.current_layer}:{st.session_state.project.width}:{st.session_state.project.height}",
+        "canvas_context": (
+            f"{int(st.session_state.canvas_epoch)}:"
+            f"{st.session_state.current_frame}:"
+            f"{st.session_state.current_layer}:"
+            f"{st.session_state.project.width}:"
+            f"{st.session_state.project.height}:"
+            f"{int(st.session_state.zoom)}"
+        ),
         "base_image": image_to_data_url(lower_canvas),
-        "active_image": image_to_data_url(active_canvas),
+        "active_raw_image": image_to_data_url(active_raw_canvas),
         "guides_image": image_to_data_url(upper_canvas),
     }
     result = pixel_canvas(data, key="editor_live_canvas")
