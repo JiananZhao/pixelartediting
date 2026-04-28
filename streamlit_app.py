@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 from typing import Any, Tuple
 
@@ -13,6 +15,7 @@ from ops_core import (
     DEFAULT_PALETTE,
     SliceInfo,
     SpriteProject,
+    adjust_image_alpha,
     box_to_xywh,
     build_sprite_sheet,
     clamp,
@@ -30,6 +33,7 @@ from ops_core import (
     translate_image,
     unique_name,
 )
+from pixel_canvas_component import has_live_pixel_canvas, pixel_canvas
 
 MAX_HISTORY = 20
 TOOLS = ["pencil", "eraser", "fill", "eyedropper", "line", "rect", "ellipse", "move", "slice"]
@@ -62,6 +66,8 @@ def init_state() -> None:
         st.session_state.future = []
     if "last_canvas_event" not in st.session_state:
         st.session_state.last_canvas_event = None
+    if "last_live_event_id" not in st.session_state:
+        st.session_state.last_live_event_id = None
     if "loaded_project_token" not in st.session_state:
         st.session_state.loaded_project_token = None
     if "loaded_image_token" not in st.session_state:
@@ -76,6 +82,7 @@ def reset_editor_state() -> None:
     st.session_state.history = []
     st.session_state.future = []
     st.session_state.last_canvas_event = None
+    st.session_state.last_live_event_id = None
     project: SpriteProject = st.session_state.project
     if project.palette:
         st.session_state.fg_color = project.palette[0]
@@ -102,6 +109,7 @@ def undo() -> None:
     st.session_state.project = st.session_state.history.pop()
     sanitize_indices()
     st.session_state.last_canvas_event = None
+    st.session_state.last_live_event_id = None
 
 
 def redo() -> None:
@@ -111,6 +119,7 @@ def redo() -> None:
     st.session_state.project = st.session_state.future.pop()
     sanitize_indices()
     st.session_state.last_canvas_event = None
+    st.session_state.last_live_event_id = None
 
 
 def raw_to_sprite(x: int, y: int, zoom: int) -> Tuple[int, int]:
@@ -139,10 +148,9 @@ def checkerboard(width: int, height: int, cell: int) -> Image.Image:
     return image
 
 
-def build_canvas_preview() -> Image.Image:
+def build_onion_sprite() -> Image.Image:
     project: SpriteProject = st.session_state.project
     frame_index = st.session_state.current_frame
-    zoom = int(st.session_state.zoom)
     onion = Image.new("RGBA", project.size, (0, 0, 0, 0))
     if st.session_state.show_onion and frame_index > 0:
         prev_img = tint_image(project.flatten_frame(frame_index - 1), (255, 80, 80), 0.45, 0.35)
@@ -150,19 +158,51 @@ def build_canvas_preview() -> Image.Image:
     if st.session_state.show_onion and frame_index < project.frame_count - 1:
         next_img = tint_image(project.flatten_frame(frame_index + 1), (80, 150, 255), 0.45, 0.35)
         onion = Image.alpha_composite(onion, next_img)
-    current = project.flatten_frame(frame_index)
-    composited = Image.alpha_composite(onion, current)
-    scaled = composited.resize((project.width * zoom, project.height * zoom), Image.Resampling.NEAREST)
-    canvas = checkerboard(scaled.width, scaled.height, max(4, zoom))
-    canvas.alpha_composite(scaled)
+    return onion
 
-    draw = ImageDraw.Draw(canvas)
+
+def build_canvas_layers() -> tuple[Image.Image, Image.Image, Image.Image]:
+    project: SpriteProject = st.session_state.project
+    frame_index = st.session_state.current_frame
+    layer_index = st.session_state.current_layer
+    zoom = int(st.session_state.zoom)
+    canvas_size = (project.width * zoom, project.height * zoom)
+
+    lower_sprite = build_onion_sprite()
+    active_sprite = Image.new("RGBA", project.size, (0, 0, 0, 0))
+    upper_sprite = Image.new("RGBA", project.size, (0, 0, 0, 0))
+
+    for idx, layer in enumerate(project.layers):
+        if not layer.visible:
+            continue
+        cel = adjust_image_alpha(project.get_cel(idx, frame_index), layer.opacity)
+        if idx < layer_index:
+            lower_sprite = Image.alpha_composite(lower_sprite, cel)
+        elif idx == layer_index:
+            active_sprite = Image.alpha_composite(active_sprite, cel)
+        else:
+            upper_sprite = Image.alpha_composite(upper_sprite, cel)
+
+    lower_scaled = lower_sprite.resize(canvas_size, Image.Resampling.NEAREST)
+    active_scaled = active_sprite.resize(canvas_size, Image.Resampling.NEAREST)
+    upper_scaled = upper_sprite.resize(canvas_size, Image.Resampling.NEAREST)
+
+    lower_canvas = checkerboard(lower_scaled.width, lower_scaled.height, max(4, zoom))
+    lower_canvas.alpha_composite(lower_scaled)
+
+    active_canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    active_canvas.alpha_composite(active_scaled)
+
+    upper_canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+    upper_canvas.alpha_composite(upper_scaled)
+
+    draw = ImageDraw.Draw(upper_canvas)
     if st.session_state.show_grid and zoom >= 8:
         line_color = (0, 0, 0, 50)
-        for x in range(0, canvas.width + 1, zoom):
-            draw.line((x, 0, x, canvas.height), fill=line_color)
-        for y in range(0, canvas.height + 1, zoom):
-            draw.line((0, y, canvas.width, y), fill=line_color)
+        for x in range(0, upper_canvas.width + 1, zoom):
+            draw.line((x, 0, x, upper_canvas.height), fill=line_color)
+        for y in range(0, upper_canvas.height + 1, zoom):
+            draw.line((0, y, upper_canvas.width, y), fill=line_color)
 
     slice_width = max(1, zoom // 6)
     for slc in project.slices:
@@ -172,10 +212,111 @@ def build_canvas_preview() -> Image.Image:
         y1 = (slc.y + slc.h) * zoom - 1
         draw.rectangle((x0, y0, x1, y1), outline=slc.color, width=slice_width)
 
-    return canvas
+    return lower_canvas, active_canvas, upper_canvas
 
 
-def apply_tool(event: dict[str, Any]) -> bool:
+def build_canvas_preview() -> Image.Image:
+    lower_canvas, active_canvas, upper_canvas = build_canvas_layers()
+    preview = lower_canvas.copy()
+    preview.alpha_composite(active_canvas)
+    preview.alpha_composite(upper_canvas)
+    return preview
+
+
+def image_to_data_url(image: Image.Image) -> str:
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def normalize_live_point(point: Any, project: SpriteProject) -> Tuple[int, int]:
+    if not isinstance(point, dict):
+        return 0, 0
+    x = int(point.get("x", 0))
+    y = int(point.get("y", 0))
+    return clamp_point((x, y), project)
+
+
+def apply_live_canvas_event(event: dict[str, Any]) -> bool:
+    project: SpriteProject = st.session_state.project
+    layer_index = st.session_state.current_layer
+    frame_index = st.session_state.current_frame
+    layer = project.layers[layer_index]
+    tool = str(event.get("tool", st.session_state.tool))
+
+    if layer.locked:
+        st.toast("Selected layer is locked.")
+        return False
+
+    start = normalize_live_point(event.get("start"), project)
+    end = normalize_live_point(event.get("end"), project)
+
+    if tool == "eyedropper":
+        color = project.flatten_frame(frame_index).getpixel(end)
+        if len(color) >= 4 and color[3] == 0:
+            st.session_state.fg_color = "#000000"
+        else:
+            st.session_state.fg_color = rgba_to_hex(color)
+        return True
+
+    if tool == "move" and start == end:
+        return False
+
+    push_history()
+
+    if tool == "slice":
+        box = normalize_box(start[0], start[1], end[0], end[1])
+        x, y, w, h = box_to_xywh(box)
+        name = unique_name("Slice", [slc.name for slc in project.slices])
+        project.slices.append(SliceInfo(name=name, x=x, y=y, w=w, h=h))
+        return True
+
+    image = project.get_cel(layer_index, frame_index).copy()
+    fg = hex_to_rgba(st.session_state.fg_color)
+    transparent = (0, 0, 0, 0)
+    brush = int(st.session_state.brush_size)
+
+    if tool in {"pencil", "eraser"}:
+        points: list[Tuple[int, int]] = []
+        raw_path = event.get("path", [])
+        if isinstance(raw_path, list):
+            for point in raw_path:
+                points.append(normalize_live_point(point, project))
+        if not points:
+            points = [start, end]
+        if points[0] != start:
+            points.insert(0, start)
+        if points[-1] != end:
+            points.append(end)
+        color = fg if tool == "pencil" else transparent
+        last = points[0]
+        draw_line_brush(image, last, last, color, brush)
+        for point in points[1:]:
+            draw_line_brush(image, last, point, color, brush)
+            last = point
+    elif tool == "fill":
+        flood_fill(image, end[0], end[1], fg)
+    elif tool == "line":
+        draw_line_brush(image, start, end, fg, brush)
+    elif tool == "rect":
+        draw = ImageDraw.Draw(image)
+        draw.rectangle(normalize_box(start[0], start[1], end[0], end[1]), outline=fg, width=brush)
+    elif tool == "ellipse":
+        draw = ImageDraw.Draw(image)
+        draw.ellipse(normalize_box(start[0], start[1], end[0], end[1]), outline=fg, width=brush)
+    elif tool == "move":
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        image = translate_image(image, dx, dy)
+    else:
+        return False
+
+    project.set_cel(layer_index, frame_index, image)
+    return True
+
+
+def apply_pointer_tool(event: dict[str, Any]) -> bool:
     project: SpriteProject = st.session_state.project
     layer_index = st.session_state.current_layer
     frame_index = st.session_state.current_frame
@@ -338,6 +479,9 @@ def render_sidebar() -> None:
             st.session_state.fg_color = palette_choice
             st.rerun()
 
+    if has_live_pixel_canvas():
+        st.sidebar.info("The canvas now uses a custom live pixel component. Brush strokes and drag previews render in the browser immediately and are committed back to the sprite on mouse release.")
+
     st.sidebar.header("History")
     c1, c2 = st.sidebar.columns(2)
     if c1.button("Undo", use_container_width=True, disabled=not st.session_state.history):
@@ -483,17 +627,10 @@ def render_slice_controls() -> None:
                 st.rerun()
 
 
-def render_canvas() -> None:
-    project: SpriteProject = st.session_state.project
-    tool = st.session_state.tool
-    cursor = "grab" if tool == "move" else ("pointer" if tool == "eyedropper" else "crosshair")
-
-    st.subheader("Canvas")
-    preview = build_canvas_preview()
-    st.caption(f"{project.width} x {project.height} px | {project.frame_count} frame(s) | {len(project.layers)} layer(s)")
+def render_legacy_pointer_canvas(preview: Image.Image, cursor: str) -> None:
     event = streamlit_image_coordinates(
         preview,
-        key="editor_canvas",
+        key="editor_canvas_drag",
         width=preview.width,
         height=preview.height,
         click_and_drag=True,
@@ -503,27 +640,90 @@ def render_canvas() -> None:
     sig = event_signature(event)
     if sig is not None and sig != st.session_state.last_canvas_event:
         st.session_state.last_canvas_event = sig
-        if apply_tool(event):
+        if apply_pointer_tool(event):
             st.rerun()
 
 
-st.set_page_config(page_title=APP_NAME, page_icon="🎨", layout="wide")
-init_state()
-render_sidebar()
-sanitize_indices()
+def extract_component_event(result: Any) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    event = getattr(result, "event", None)
+    if isinstance(event, dict):
+        return event
+    if isinstance(result, dict):
+        maybe_event = result.get("event")
+        if isinstance(maybe_event, dict):
+            return maybe_event
+    return None
 
-st.title(APP_NAME)
-st.caption("A browser-oriented Streamlit port of the original desktop editor. It reuses the project format and Pillow-based editing core, but the UI is rewritten for the web.")
 
-left, right = st.columns([2.4, 1.2])
-with left:
-    render_canvas()
-with right:
-    render_frame_controls()
-    render_layer_controls()
-    render_slice_controls()
+def render_live_canvas(cursor: str) -> None:
+    lower_canvas, active_canvas, upper_canvas = build_canvas_layers()
+    data = {
+        "width": lower_canvas.width,
+        "height": lower_canvas.height,
+        "sprite_width": st.session_state.project.width,
+        "sprite_height": st.session_state.project.height,
+        "zoom": int(st.session_state.zoom),
+        "tool": st.session_state.tool,
+        "brush_size": int(st.session_state.brush_size),
+        "fg_css": str(st.session_state.fg_color),
+        "slice_color": "#00ffff",
+        "cursor": cursor,
+        "base_image": image_to_data_url(lower_canvas),
+        "active_image": image_to_data_url(active_canvas),
+        "guides_image": image_to_data_url(upper_canvas),
+    }
+    result = pixel_canvas(data, key="editor_live_canvas")
+    event = extract_component_event(result)
+    if event is None:
+        return
+    event_id = str(event.get("id", ""))
+    if not event_id or event_id == st.session_state.last_live_event_id:
+        return
+    st.session_state.last_live_event_id = event_id
+    if apply_live_canvas_event(event):
+        st.rerun()
 
-sheet, meta = build_sprite_sheet(st.session_state.project)
-with st.expander("Sprite sheet preview", expanded=False):
-    st.image(sheet, caption=f"{meta['meta']['size']['w']} x {meta['meta']['size']['h']} px", use_container_width=False)
-    st.json(meta)
+
+def render_canvas() -> None:
+    project: SpriteProject = st.session_state.project
+    tool = st.session_state.tool
+    cursor = "grab" if tool == "move" else ("pointer" if tool == "eyedropper" else "crosshair")
+
+    st.subheader("Canvas")
+    st.caption(f"{project.width} x {project.height} px | {project.frame_count} frame(s) | {len(project.layers)} layer(s)")
+
+    if has_live_pixel_canvas():
+        render_live_canvas(cursor)
+    else:
+        preview = build_canvas_preview()
+        st.warning("Live pixel preview is unavailable because `st.components.v2` is not present in this Streamlit build. Falling back to the older click-and-drag canvas.")
+        render_legacy_pointer_canvas(preview, cursor)
+
+
+def main() -> None:
+    st.set_page_config(page_title=APP_NAME, page_icon="🎨", layout="wide")
+    init_state()
+    render_sidebar()
+    sanitize_indices()
+
+    st.title(APP_NAME)
+    st.caption("A browser-oriented Streamlit port of the original desktop editor. The canvas now uses a custom live pixel component so brush strokes and drag previews appear immediately in the browser instead of waiting until mouse release.")
+
+    left, right = st.columns([2.4, 1.2])
+    with left:
+        render_canvas()
+    with right:
+        render_frame_controls()
+        render_layer_controls()
+        render_slice_controls()
+
+    sheet, meta = build_sprite_sheet(st.session_state.project)
+    with st.expander("Sprite sheet preview", expanded=False):
+        st.image(sheet, caption=f"{meta['meta']['size']['w']} x {meta['meta']['size']['h']} px", use_container_width=False)
+        st.json(meta)
+
+
+if __name__ == "__main__":
+    main()
