@@ -68,6 +68,10 @@ def init_state() -> None:
         st.session_state.last_canvas_event = None
     if "last_live_event_id" not in st.session_state:
         st.session_state.last_live_event_id = None
+    if "last_live_event_seq" not in st.session_state:
+        st.session_state.last_live_event_seq = 0
+    if "canvas_epoch" not in st.session_state:
+        st.session_state.canvas_epoch = 0
     if "loaded_project_token" not in st.session_state:
         st.session_state.loaded_project_token = None
     if "loaded_image_token" not in st.session_state:
@@ -83,6 +87,7 @@ def reset_editor_state() -> None:
     st.session_state.future = []
     st.session_state.last_canvas_event = None
     st.session_state.last_live_event_id = None
+    bump_canvas_epoch()
     project: SpriteProject = st.session_state.project
     if project.palette:
         st.session_state.fg_color = project.palette[0]
@@ -93,6 +98,10 @@ def sanitize_indices() -> None:
     project: SpriteProject = st.session_state.project
     st.session_state.current_frame = clamp(int(st.session_state.current_frame), 0, project.frame_count - 1)
     st.session_state.current_layer = clamp(int(st.session_state.current_layer), 0, len(project.layers) - 1)
+
+
+def bump_canvas_epoch() -> None:
+    st.session_state.canvas_epoch = int(st.session_state.get("canvas_epoch", 0)) + 1
 
 
 def push_history() -> None:
@@ -108,6 +117,7 @@ def undo() -> None:
     st.session_state.future.append(st.session_state.project.clone())
     st.session_state.project = st.session_state.history.pop()
     sanitize_indices()
+    bump_canvas_epoch()
     st.session_state.last_canvas_event = None
     st.session_state.last_live_event_id = None
 
@@ -118,6 +128,7 @@ def redo() -> None:
     st.session_state.history.append(st.session_state.project.clone())
     st.session_state.project = st.session_state.future.pop()
     sanitize_indices()
+    bump_canvas_epoch()
     st.session_state.last_canvas_event = None
     st.session_state.last_live_event_id = None
 
@@ -546,19 +557,23 @@ def render_frame_controls() -> None:
     c1, c2, c3, c4 = st.columns(4)
     if c1.button("Add blank frame", use_container_width=True):
         push_history()
+        bump_canvas_epoch()
         st.session_state.current_frame = project.add_frame(index=st.session_state.current_frame + 1)
         st.rerun()
     if c2.button("Duplicate frame", use_container_width=True):
         push_history()
+        bump_canvas_epoch()
         st.session_state.current_frame = project.add_frame(index=st.session_state.current_frame + 1, copy_from=st.session_state.current_frame)
         st.rerun()
     if c3.button("Delete frame", use_container_width=True, disabled=project.frame_count <= 1):
         push_history()
+        bump_canvas_epoch()
         project.remove_frame(st.session_state.current_frame)
         sanitize_indices()
         st.rerun()
     if c4.button("Reverse frames", use_container_width=True, disabled=project.frame_count <= 1):
         push_history()
+        bump_canvas_epoch()
         project.frame_durations.reverse()
         for layer in project.layers:
             layer.cels.reverse()
@@ -587,25 +602,30 @@ def render_layer_controls() -> None:
     c1, c2, c3 = st.columns(3)
     if c1.button("Add layer", use_container_width=True):
         push_history()
+        bump_canvas_epoch()
         st.session_state.current_layer = project.add_layer(index=st.session_state.current_layer + 1)
         st.rerun()
     if c2.button("Delete layer", use_container_width=True, disabled=len(project.layers) <= 1):
         push_history()
+        bump_canvas_epoch()
         project.remove_layer(st.session_state.current_layer)
         sanitize_indices()
         st.rerun()
     if c3.button("Clear cel", use_container_width=True):
         push_history()
+        bump_canvas_epoch()
         project.clear_cel(st.session_state.current_layer, st.session_state.current_frame)
         st.rerun()
 
     c4, c5 = st.columns(2)
     if c4.button("Layer up", use_container_width=True, disabled=st.session_state.current_layer >= len(project.layers) - 1):
         push_history()
+        bump_canvas_epoch()
         st.session_state.current_layer = project.move_layer(st.session_state.current_layer, st.session_state.current_layer + 1)
         st.rerun()
     if c5.button("Layer down", use_container_width=True, disabled=st.session_state.current_layer <= 0):
         push_history()
+        bump_canvas_epoch()
         st.session_state.current_layer = project.move_layer(st.session_state.current_layer, st.session_state.current_layer - 1)
         st.rerun()
 
@@ -623,6 +643,7 @@ def render_slice_controls() -> None:
             cols[2].write(f"w={slc.w}, h={slc.h}")
             if cols[3].button("Delete", key=f"delete_slice_{idx}", use_container_width=True):
                 push_history()
+                bump_canvas_epoch()
                 del project.slices[idx]
                 st.rerun()
 
@@ -670,6 +691,9 @@ def render_live_canvas(cursor: str) -> None:
         "fg_css": str(st.session_state.fg_color),
         "slice_color": "#00ffff",
         "cursor": cursor,
+        "layer_locked": bool(st.session_state.project.layers[st.session_state.current_layer].locked),
+        "acked_event_seq": int(st.session_state.last_live_event_seq),
+        "canvas_context": f"{int(st.session_state.canvas_epoch)}:{st.session_state.current_frame}:{st.session_state.current_layer}:{st.session_state.project.width}:{st.session_state.project.height}",
         "base_image": image_to_data_url(lower_canvas),
         "active_image": image_to_data_url(active_canvas),
         "guides_image": image_to_data_url(upper_canvas),
@@ -679,7 +703,12 @@ def render_live_canvas(cursor: str) -> None:
     if event is None:
         return
     event_id = str(event.get("id", ""))
-    if not event_id or event_id == st.session_state.last_live_event_id:
+    event_seq = int(event.get("seq", 0) or 0)
+    if event_seq:
+        if event_seq <= int(st.session_state.last_live_event_seq):
+            return
+        st.session_state.last_live_event_seq = event_seq
+    elif not event_id or event_id == st.session_state.last_live_event_id:
         return
     st.session_state.last_live_event_id = event_id
     if apply_live_canvas_event(event):
@@ -694,36 +723,4 @@ def render_canvas() -> None:
     st.subheader("Canvas")
     st.caption(f"{project.width} x {project.height} px | {project.frame_count} frame(s) | {len(project.layers)} layer(s)")
 
-    if has_live_pixel_canvas():
-        render_live_canvas(cursor)
-    else:
-        preview = build_canvas_preview()
-        st.warning("Live pixel preview is unavailable because `st.components.v2` is not present in this Streamlit build. Falling back to the older click-and-drag canvas.")
-        render_legacy_pointer_canvas(preview, cursor)
-
-
-def main() -> None:
-    st.set_page_config(page_title=APP_NAME, page_icon="🎨", layout="wide")
-    init_state()
-    render_sidebar()
-    sanitize_indices()
-
-    st.title(APP_NAME)
-    st.caption("A browser-oriented Streamlit port of the original desktop editor. The canvas now uses a custom live pixel component so brush strokes and drag previews appear immediately in the browser instead of waiting until mouse release.")
-
-    left, right = st.columns([2.4, 1.2])
-    with left:
-        render_canvas()
-    with right:
-        render_frame_controls()
-        render_layer_controls()
-        render_slice_controls()
-
-    sheet, meta = build_sprite_sheet(st.session_state.project)
-    with st.expander("Sprite sheet preview", expanded=False):
-        st.image(sheet, caption=f"{meta['meta']['size']['w']} x {meta['meta']['size']['h']} px", use_container_width=False)
-        st.json(meta)
-
-
-if __name__ == "__main__":
-    main()
+    if has_live_pixel
